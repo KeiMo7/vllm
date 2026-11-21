@@ -38,6 +38,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.batch_trace import BatchTraceRecorder
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -94,6 +95,10 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level default so partially-initialized schedulers (e.g. tests
+    # using object.__new__) behave as if tracing were disabled.
+    batch_trace_recorder: BatchTraceRecorder | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -123,6 +128,11 @@ class Scheduler(SchedulerInterface):
             self.kv_metrics_collector = KVCacheMetricsCollector(
                 self.observability_config.kv_cache_metrics_sample,
             )
+        # Per-batch composition trace; None unless VLLM_BATCH_TRACE_DIR is
+        # set, in which case the check below is the only per-step cost.
+        self.batch_trace_recorder = BatchTraceRecorder.from_env(
+            meta={"block_size": block_size}
+        )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
         self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
@@ -1813,6 +1823,20 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if self.batch_trace_recorder is not None and total_num_scheduled_tokens > 0:
+            self.batch_trace_recorder.record_batch(
+                new_reqs=scheduled_new_reqs,
+                cached_reqs=scheduled_running_reqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_waiting=len(self.waiting),
+                running_reqs=self.running,
+                kv_free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                kv_total_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
+                block_size=self.block_size,
+                num_preempted=len(scheduler_output.preempted_req_ids or ()),
+                finished_req_ids=scheduler_output.finished_req_ids,
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2337,6 +2361,11 @@ class Scheduler(SchedulerInterface):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
+        if (
+            self.batch_trace_recorder is not None
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            self.batch_trace_recorder.record_step_end()
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         prompt_token_id_logprobs_dict = (
@@ -3511,6 +3540,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.batch_trace_recorder is not None:
+            self.batch_trace_recorder.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

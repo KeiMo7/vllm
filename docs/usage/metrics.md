@@ -129,6 +129,69 @@ enabled.
     and query costs. Keep custom lists short, and only override the families
     you actively monitor.
 
+## Batch Composition Tracing
+
+Production metrics answer "how large were batches"; they cannot answer
+"which requests were batched together". For that, vLLM can write a
+per-batch composition trace: one JSON record per scheduled batch and one
+per batch completion, appended to rotating JSONL files. Traces let you
+replay the exact batch composition of a run, compare two runs of the same
+workload, and tell whether a throughput drop came from smaller batches or
+from slower steps.
+
+Enable it by pointing `VLLM_BATCH_TRACE_DIR` at a writable directory:
+
+```bash
+VLLM_BATCH_TRACE_DIR=/var/log/vllm/batch_trace vllm serve ...
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VLLM_BATCH_TRACE_DIR` | unset (off) | Directory for trace files. Unset means fully disabled with zero per-step cost. |
+| `VLLM_BATCH_TRACE_MAX_FILE_BYTES` | 268435456 | Rotate the active file once it exceeds this size. |
+| `VLLM_BATCH_TRACE_MAX_FILE_SECONDS` | 0 | Rotate the active file after this many seconds; 0 disables time-based rotation. |
+
+Each line is a self-contained JSON object. Batch records carry, per
+request, only its id and token counts (`prompt`, `computed`, `output`,
+`sched`) — never prompt text or token ids — plus batch-level KV-cache
+usage: `kv_usage` (fraction of blocks in use), and `kv_slots` vs.
+`kv_tokens`, whose gap is internal fragmentation (tail-block padding and
+slots reserved for future appends). `step_end` records pair with batch
+records by `seq`, giving per-batch start/end timestamps.
+
+Inspect a trace, optionally restricted to a time window:
+
+```bash
+python -m vllm.v1.core.batch_trace summarize /var/log/vllm/batch_trace
+python -m vllm.v1.core.batch_trace summarize /var/log/vllm/batch_trace \
+    --start 1730000000.0 --end 1730000600.0
+```
+
+Compare two runs of the same request set — the report shows the first
+batch whose membership diverged, per-request admission-order shifts, and
+both runs' average batch size and step duration:
+
+```bash
+python -m vllm.v1.core.batch_trace diff run_a/ run_b/
+```
+
+Characteristics and known limitations:
+
+- Records are flushed to the OS after every write, so killing the engine
+  with `SIGKILL` does not lose already-produced records. There is no
+  `fsync`; durability against a machine crash is out of scope.
+- If the trace directory is not writable, a warning is logged and
+  inference continues without tracing. Individual write failures are
+  counted and skipped; 64 consecutive failures disable tracing.
+- With tracing enabled, per-step overhead is tens of microseconds
+  (JSON encoding plus one flushed write); with it disabled, the only cost
+  is one `None` check per scheduling step.
+- `step_end` records pair with batches in FIFO completion order. With
+  async scheduling or pipeline parallelism, batch execution overlaps, so
+  an end timestamp marks output processing, not kernel completion.
+- Trace files are a debugging artifact: old vLLM versions neither read
+  nor produce them, and no model weights or cached data are affected.
+
 ## Deprecation Policy
 
 Note: when metrics are deprecated in version `X.Y`, they are hidden in version `X.Y+1`

@@ -174,6 +174,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_PARALLEL_INDEX_TOPK: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+    VLLM_BATCH_TRACE_DIR: str | None = None
+    VLLM_BATCH_TRACE_MAX_FILE_BYTES: int = 256 * 1024 * 1024
+    VLLM_BATCH_TRACE_MAX_FILE_SECONDS: float = 0.0
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -1587,6 +1590,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
+    ),
+    # Directory for per-batch composition trace files (JSONL). When unset
+    # (default), batch tracing is fully disabled with zero overhead. When
+    # set, the v1 scheduler appends one record per scheduled batch and one
+    # per batch completion; records hold request ids and token counts only,
+    # never prompt text or token ids. Analyze with
+    # `python -m vllm.v1.core.batch_trace summarize|diff <path>`.
+    "VLLM_BATCH_TRACE_DIR": lambda: os.getenv("VLLM_BATCH_TRACE_DIR"),
+    # Rotate the active batch trace file once it exceeds this many bytes.
+    "VLLM_BATCH_TRACE_MAX_FILE_BYTES": lambda: int(
+        os.getenv("VLLM_BATCH_TRACE_MAX_FILE_BYTES", str(256 * 1024 * 1024))
+    ),
+    # Rotate the active batch trace file after this many seconds.
+    # 0 (default) disables time-based rotation.
+    "VLLM_BATCH_TRACE_MAX_FILE_SECONDS": lambda: float(
+        os.getenv("VLLM_BATCH_TRACE_MAX_FILE_SECONDS", "0")
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     # If set to "0", disable LayerName opaque type for layer_name
