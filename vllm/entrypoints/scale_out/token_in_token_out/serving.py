@@ -499,6 +499,7 @@ class ServingTokens(GenerateBaseServing):
             lora_request=lora_request,
             trace_headers=trace_headers,
             priority=self._get_priority(request, raw_request),
+            tenant_id=self._get_tenant_id(raw_request),
             data_parallel_rank=data_parallel_rank,
             session_id=session_id,
             reasoning_ended=request.reasoning_ended,

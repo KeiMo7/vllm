@@ -259,6 +259,12 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Per-tenant counters when --tenant-config enables fair sharing. Each entry
+    # holds only the tenant identifier and counts (served, borrowed, lent), so
+    # nothing request-derived beyond the identifier is reported. Empty when
+    # the feature is off, which keeps existing metrics unchanged.
+    tenant_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+
 
 @dataclass(slots=True)
 class RequestStateStats:

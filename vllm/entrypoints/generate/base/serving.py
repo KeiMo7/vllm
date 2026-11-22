@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 _T = TypeVar("_T")
 SESSION_ID_HEADER = "X-Session-ID"
 PRIORITY_HEADER = "X-Vllm-Priority"
+TENANT_HEADER = "X-Vllm-Tenant-Id"
 
 
 def build_per_request_timing_metrics(
@@ -257,6 +258,23 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
                         )
                     return value
         return request.priority
+
+    @staticmethod
+    def _get_tenant_id(raw_request: Request | None) -> str | None:
+        """Read the request's tenant identifier, if it carries one.
+
+        The value is returned verbatim; the scheduler validates it against the
+        configured tenant set and routes a rejected identifier to the default
+        group. The header is the only source: the identifier is never derived
+        from the request id or from arrival order.
+        """
+        if raw_request is None:
+            return None
+        value = raw_request.headers.get(TENANT_HEADER)
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
     async def _with_kv_transfer_rejection_cleanup(
         self,

@@ -252,6 +252,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     session_id=session_id,
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
+                    tenant_id=self._get_tenant_id(raw_request),
                 )
             else:
                 generator = self.engine_client.generate(
@@ -263,6 +264,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    tenant_id=self._get_tenant_id(raw_request),
                 )
 
             generators.append(generator)

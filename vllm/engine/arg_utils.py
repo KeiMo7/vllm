@@ -114,6 +114,7 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.tenant import TenantConfig, TenantShare
 from vllm.config.utils import get_field, replace
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.config.watermarking import WatermarkConfig
@@ -719,6 +720,7 @@ class EngineArgs:
     spec_model: str | None = None
     spec_tokens: int | None = None
     watermark_config: dict[str, Any] | None = None
+    tenant_config: dict[str, Any] | None = None
     diffusion_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
@@ -1878,6 +1880,10 @@ class EngineArgs:
         )
         vllm_kwargs["watermark_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument("--watermark-config", **vllm_kwargs["watermark_config"])
+        # TenantConfig is nested (a list of per-tenant shares), so delay its
+        # Pydantic validation the same way as the other JSON configs.
+        vllm_kwargs["tenant_config"]["type"] = optional_type(json.loads)
+        vllm_group.add_argument("--tenant-config", **vllm_kwargs["tenant_config"])
         vllm_kwargs["diffusion_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
             "--diffusion-config", "-dc", **vllm_kwargs["diffusion_config"]
@@ -2200,6 +2206,18 @@ class EngineArgs:
         if isinstance(cfg, str):
             cfg = json.loads(cfg)
         return WatermarkConfig(**cfg)
+
+    def create_tenant_config(self) -> TenantConfig:
+        if self.tenant_config is None:
+            return TenantConfig()
+        cfg = self.tenant_config
+        if isinstance(cfg, str):
+            cfg = json.loads(cfg)
+        tenants = [
+            TenantShare(**share) if isinstance(share, dict) else share
+            for share in cfg.get("tenants", [])
+        ]
+        return TenantConfig(**{**cfg, "tenants": tenants})
 
     def create_structured_outputs_config(self) -> StructuredOutputsConfig:
         """Merge frontend parser flags into the structured outputs config.
@@ -2648,6 +2666,7 @@ class EngineArgs:
         )
         diffusion_config = self.create_diffusion_config()
         watermark_config = self.create_watermark_config()
+        tenant_config = self.create_tenant_config()
 
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
@@ -2918,6 +2937,7 @@ class EngineArgs:
             lora_config=lora_config,
             speculative_config=speculative_config,
             watermark_config=watermark_config,
+            tenant_config=tenant_config,
             diffusion_config=diffusion_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

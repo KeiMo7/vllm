@@ -672,6 +672,42 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     counter_watermark_requests, per_engine_labelvalues_with_status
                 )
 
+        # Per-tenant fair-share metrics. Created only when the feature is on,
+        # so the existing metric set is unchanged otherwise. The tenant label
+        # is the validated identifier; no prompt content is ever reported.
+        self.gauge_tenant_served_tokens: Gauge | None = None
+        self.gauge_tenant_borrowed_tokens: Gauge | None = None
+        self.gauge_tenant_lent_tokens: Gauge | None = None
+        if vllm_config.tenant_config.enabled:
+            self.gauge_tenant_served_tokens = self._gauge_cls(
+                name="vllm:tenant_served_tokens",
+                documentation=(
+                    "Cumulative tokens served to a tenant while it has been "
+                    "active (only with tenant_config)."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames + ["tenant"],
+            )
+            self.gauge_tenant_borrowed_tokens = self._gauge_cls(
+                name="vllm:tenant_borrowed_tokens",
+                documentation=(
+                    "Tokens a tenant was served beyond its configured share, "
+                    "i.e. share borrowed from idle tenants "
+                    "(only with tenant_config)."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames + ["tenant"],
+            )
+            self.gauge_tenant_lent_tokens = self._gauge_cls(
+                name="vllm:tenant_lent_tokens",
+                documentation=(
+                    "Tokens of a tenant's own share that borrowers used "
+                    "(only with tenant_config)."
+                ),
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames + ["tenant"],
+            )
+
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
             documentation=(
@@ -1180,6 +1216,19 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            if self.gauge_tenant_served_tokens is not None:
+                labelvalues = self.per_engine_labelvalues[engine_idx]
+                for tenant, counters in scheduler_stats.tenant_stats.items():
+                    self.gauge_tenant_served_tokens.labels(*labelvalues, tenant).set(
+                        counters.get("served", 0)
+                    )
+                    self.gauge_tenant_borrowed_tokens.labels(*labelvalues, tenant).set(
+                        counters.get("borrowed", 0)
+                    )
+                    self.gauge_tenant_lent_tokens.labels(*labelvalues, tenant).set(
+                        counters.get("lent", 0)
+                    )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

@@ -432,6 +432,7 @@ class LLM(
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[RequestOutput]:
@@ -457,6 +458,13 @@ class LLM(
             lora_request: LoRA request to use for generation, if any.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
+                When it is a single value, it is applied to every prompt.
+                When it is a list, the list must have the same length as the
+                prompts and it is paired one by one with the prompt.
+            tenant: The tenant identifier of the requests, if any.
+                Only applicable when per-tenant scheduling is enabled
+                (`--tenant-config`). The identifier must be listed in that
+                configuration; anything else is served from the default group.
                 When it is a single value, it is applied to every prompt.
                 When it is a list, the list must have the same length as the
                 prompts and it is paired one by one with the prompt.
@@ -487,6 +495,7 @@ class LLM(
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
+            tenant=tenant,
             mm_processor_kwargs=mm_processor_kwargs,
         )
 
@@ -496,6 +505,7 @@ class LLM(
         sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         use_tqdm: bool | Callable[..., tqdm] = True,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -516,6 +526,13 @@ class LLM(
                 When it is a list, the list must have the same length as the
                 prompts and it is paired one by one with the prompt.
             use_tqdm: If True, shows a tqdm progress bar while adding requests.
+            tenant: The tenant identifier of the requests, if any.
+                Only applicable when per-tenant scheduling is enabled
+                (`--tenant-config`). The identifier must be listed in that
+                configuration; anything else is served from the default group.
+                When it is a single value, it is applied to every prompt.
+                When it is a list, the list must have the same length as the
+                prompts and it is paired one by one with the prompt.
             tokenization_kwargs: Overrides for `tokenizer.encode`.
             mm_processor_kwargs: Overrides for `processor.__call__`.
 
@@ -536,6 +553,7 @@ class LLM(
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             priority=priority,
+            tenant=tenant,
             tokenization_kwargs=tokenization_kwargs,
             mm_processor_kwargs=mm_processor_kwargs,
         )
@@ -631,6 +649,7 @@ class LLM(
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         chat_template: str | None = None,
         chat_template_content_format: ChatTemplateContentFormatOption = "auto",
         add_generation_prompt: bool = True,
@@ -667,6 +686,13 @@ class LLM(
             lora_request: LoRA request to use for generation, if any.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
+                When it is a single value, it is applied to every prompt.
+                When it is a list, the list must have the same length as the
+                prompts and it is paired one by one with the prompt.
+            tenant: The tenant identifier of the requests, if any.
+                Only applicable when per-tenant scheduling is enabled
+                (`--tenant-config`). The identifier must be listed in that
+                configuration; anything else is served from the default group.
                 When it is a single value, it is applied to every prompt.
                 When it is a list, the list must have the same length as the
                 prompts and it is paired one by one with the prompt.
@@ -715,6 +741,7 @@ class LLM(
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             priority=priority,
+            tenant=tenant,
             chat_template=chat_template,
             chat_template_content_format=chat_template_content_format,
             chat_template_kwargs=chat_template_kwargs,
@@ -733,6 +760,7 @@ class LLM(
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         chat_template: str | None = None,
         chat_template_content_format: ChatTemplateContentFormatOption = "auto",
         add_generation_prompt: bool = True,
@@ -760,6 +788,13 @@ class LLM(
             lora_request: LoRA request to use for generation, if any.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
+                When it is a single value, it is applied to every prompt.
+                When it is a list, the list must have the same length as the
+                prompts and it is paired one by one with the prompt.
+            tenant: The tenant identifier of the requests, if any.
+                Only applicable when per-tenant scheduling is enabled
+                (`--tenant-config`). The identifier must be listed in that
+                configuration; anything else is served from the default group.
                 When it is a single value, it is applied to every prompt.
                 When it is a list, the list must have the same length as the
                 prompts and it is paired one by one with the prompt.
@@ -797,6 +832,7 @@ class LLM(
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             priority=priority,
+            tenant=tenant,
             chat_template=chat_template,
             chat_template_content_format=chat_template_content_format,
             chat_template_kwargs=chat_template_kwargs,

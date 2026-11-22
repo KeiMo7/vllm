@@ -301,6 +301,22 @@ class OfflineInferenceMixin:
 
         return [priority] * num_requests
 
+    def _tenant_to_seq(
+        self,
+        tenant: str | Sequence[str | None] | None,
+        num_requests: int,
+    ) -> Sequence[str | None]:
+        if tenant is None:
+            return [None] * num_requests
+        if isinstance(tenant, Sequence) and not isinstance(tenant, str):
+            if len(tenant) != num_requests:
+                raise VLLMValidationError(
+                    f"The lengths of prompts ({num_requests}) "
+                    f"and tenant ({len(tenant)}) must be the same."
+                )
+            return tenant
+        return [tenant] * num_requests
+
     def _add_completion_requests(
         self,
         prompts: PromptType | Sequence[PromptType],
@@ -311,6 +327,7 @@ class OfflineInferenceMixin:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[str]:
@@ -318,6 +335,7 @@ class OfflineInferenceMixin:
         seq_params = self._params_to_seq(params, len(seq_prompts))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_prompts))
         seq_priority = self._priority_to_seq(priority, len(seq_prompts))
+        seq_tenant = self._tenant_to_seq(tenant, len(seq_prompts))
 
         return self._render_and_add_requests(
             prompts=(
@@ -335,6 +353,7 @@ class OfflineInferenceMixin:
             params=seq_params,
             lora_requests=seq_lora_requests,
             priorities=seq_priority,
+            tenants=seq_tenant,
         )
 
     def _run_completion(
@@ -348,6 +367,7 @@ class OfflineInferenceMixin:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ):
@@ -357,6 +377,7 @@ class OfflineInferenceMixin:
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             priority=priority,
+            tenant=tenant,
             tokenization_kwargs=tokenization_kwargs,
             mm_processor_kwargs=mm_processor_kwargs,
         )
@@ -374,6 +395,7 @@ class OfflineInferenceMixin:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         chat_template: str | None = None,
         chat_template_content_format: ChatTemplateContentFormatOption = "auto",
         add_generation_prompt: bool = True,
@@ -411,6 +433,7 @@ class OfflineInferenceMixin:
         use_tqdm: bool | Callable[..., tqdm] = True,
         lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
         priority: int | Sequence[int] | None = None,
+        tenant: str | Sequence[str | None] | None = None,
         chat_template: str | None = None,
         chat_template_content_format: ChatTemplateContentFormatOption = "auto",
         add_generation_prompt: bool = True,
@@ -424,6 +447,7 @@ class OfflineInferenceMixin:
         seq_params = self._params_to_seq(params, len(seq_convs))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_convs))
         seq_priority = self._priority_to_seq(priority, len(seq_convs))
+        seq_tenant = self._tenant_to_seq(tenant, len(seq_convs))
 
         # When thinking is enabled or tools are provided, and the model
         # uses special tokens for structured output (e.g. Gemma4's
@@ -458,6 +482,7 @@ class OfflineInferenceMixin:
             params=seq_params,
             lora_requests=seq_lora_requests,
             priorities=seq_priority,
+            tenants=seq_tenant,
         )
 
     def _adjust_params_for_parsing(
@@ -543,6 +568,7 @@ class OfflineInferenceMixin:
         *,
         lora_requests: Sequence[LoRARequest | None] | None = None,
         priorities: Sequence[int] | None = None,
+        tenants: Sequence[str | None] | None = None,
     ) -> list[str]:
         added_request_ids: list[str] = []
 
@@ -556,6 +582,7 @@ class OfflineInferenceMixin:
                         None if lora_requests is None else lora_requests[i],
                     ),
                     priority=0 if priorities is None else priorities[i],
+                    tenant=None if tenants is None else tenants[i],
                 )
                 added_request_ids.append(request_id)
         except Exception as e:
@@ -571,6 +598,7 @@ class OfflineInferenceMixin:
         params: SamplingParams | PoolingParams,
         lora_request: LoRARequest | None = None,
         priority: int = 0,
+        tenant: str | None = None,
     ) -> str:
         if isinstance(params, SamplingParams):
             # We only care about the final output
@@ -584,6 +612,7 @@ class OfflineInferenceMixin:
             params,
             lora_request=lora_request,
             priority=priority,
+            tenant_id=tenant,
         )
 
     def _run_engine(

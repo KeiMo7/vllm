@@ -53,6 +53,43 @@ def test_optional_type():
     assert optional_type_func("42") == 42
 
 
+def test_tenant_config_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--model",
+            "dummy",
+            "--tenant-config",
+            (
+                '{"enabled":true,"tenants":[{"name":"team-a","weight":2.0},'
+                '{"name":"team-b","max_running_reqs":64}],"share_tolerance":0.1}'
+            ),
+        ]
+    )
+
+    config = EngineArgs.from_cli_args(args).create_tenant_config()
+
+    assert config.enabled is True
+    assert [t.name for t in config.tenants] == ["team-a", "team-b"]
+    assert config.tenants[0].weight == 2.0
+    assert config.tenants[1].max_running_reqs == 64
+    assert config.share_tolerance == 0.1
+
+
+def test_tenant_config_cli_rejects_duplicate_tenant():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--model",
+            "dummy",
+            "--tenant-config",
+            '{"tenants":[{"name":"a"},{"name":"a"}]}',
+        ]
+    )
+    with pytest.raises(ValueError, match=r"tenants\[1\]\.name"):
+        EngineArgs.from_cli_args(args).create_tenant_config()
+
+
 def test_watermark_config_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(

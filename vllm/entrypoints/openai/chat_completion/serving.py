@@ -406,6 +406,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     session_id=session_id,
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
+                    tenant_id=self._get_tenant_id(raw_request),
                 )
             else:
                 generator = self.engine_client.generate(
@@ -417,6 +418,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    tenant_id=self._get_tenant_id(raw_request),
                     **self._engine_reasoning_kwargs(
                         request, parser, chat_template_kwargs, prompt_token_ids
                     ),

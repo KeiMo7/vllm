@@ -427,6 +427,7 @@ class AsyncLLM(EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        tenant_id: str | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
         if self.errored:
@@ -466,6 +467,7 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank,
                 session_id,
                 kv_hints,
+                tenant_id,
             )
 
         # Convert Input --> Request.
@@ -507,6 +509,7 @@ class AsyncLLM(EngineClient):
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
                     kv_hints=kv_hints,
+                    tenant_id=tenant_id,
                 )
             else:
                 # Raw prompts require tokenization and possibly multimodal
@@ -524,6 +527,7 @@ class AsyncLLM(EngineClient):
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
                     kv_hints=kv_hints,
+                    tenant_id=tenant_id,
                 )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -613,6 +617,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        tenant_id: str | None = None,
     ) -> RequestOutputCollector:
         self._validate_resumable_request()
         self._validate_streaming_input_sampling_params(sampling_params)
@@ -627,6 +632,7 @@ class AsyncLLM(EngineClient):
             data_parallel_rank=data_parallel_rank,
             session_id=session_id,
             kv_hints=kv_hints,
+            tenant_id=tenant_id,
         )
 
         if not sampling_params.skip_clone:
@@ -756,6 +762,7 @@ class AsyncLLM(EngineClient):
         kv_hints: KvHintsEnvelope | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        tenant_id: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Main function called by the API server to kick off a request
             * 1) Making an AsyncStream corresponding to the Request.
@@ -798,6 +805,7 @@ class AsyncLLM(EngineClient):
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                tenant_id=tenant_id,
             )
 
             # The output_handler task pushes items into the queue.

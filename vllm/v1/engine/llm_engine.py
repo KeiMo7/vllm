@@ -241,6 +241,7 @@ class LLMEngine:
         session_id: str | None = None,
         prompt_text: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        tenant_id: str | None = None,
     ) -> str:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -282,6 +283,7 @@ class LLMEngine:
                 priority=priority,
                 session_id=session_id,
                 kv_hints=kv_hints,
+                tenant_id=tenant_id,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 

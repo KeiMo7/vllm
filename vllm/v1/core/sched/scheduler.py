@@ -9,6 +9,7 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
+from vllm.config.tenant import resolve_tenant
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     retained_objects,
@@ -59,6 +60,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.tenant_queue import TenantLedger, TenantRequestQueue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import (
@@ -237,18 +239,52 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
-        # Waiting requests that hold KV blocks are always drained before
-        # self.waiting: a block-holder must never sit behind a request whose
-        # failed allocation would stop the scheduling scan.
-        self.kv_holding_waiting = create_request_queue(self.policy)
-        # With either async-load limit, keep requests that may load KV async
-        # separate so throttling their loads doesn't block local requests.
-        self.async_kv_waiting = create_request_queue(self.policy)
+        # Per-tenant fair sharing is off unless at least two tenants are
+        # configured; when off, the plain queues below are used unchanged.
+        self.tenant_config = vllm_config.tenant_config
+        self.tenant_ledger: TenantLedger | None = None
+        self.tenant_enabled = (
+            self.tenant_config.enabled
+            and self.tenant_config.num_configured_tenants >= 2
+        )
+        if self.tenant_enabled:
+            self.tenant_ledger = TenantLedger(self.tenant_config)
+            self.waiting = TenantRequestQueue(
+                lambda: create_request_queue(self.policy), self.tenant_ledger
+            )
+            self.kv_holding_waiting = TenantRequestQueue(
+                lambda: create_request_queue(self.policy), self.tenant_ledger
+            )
+            self.async_kv_waiting = TenantRequestQueue(
+                lambda: create_request_queue(self.policy), self.tenant_ledger
+            )
+        else:
+            self.waiting = create_request_queue(self.policy)
+            # Waiting requests that hold KV blocks are always drained before
+            # self.waiting: a block-holder must never sit behind a request whose
+            # failed allocation would stop the scheduling scan.
+            self.kv_holding_waiting = create_request_queue(self.policy)
+            # With either async-load limit, keep requests that may load KV async
+            # separate so throttling their loads doesn't block local requests.
+            self.async_kv_waiting = create_request_queue(self.policy)
         # Waiting requests that are deferred, i.e. were skipped by the scheduling
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
+
+        # Tenant fair-share state. `_tenant_running_counts` mirrors RUNNING by
+        # tenant and `_tenant_warned` keeps the invalid-identifier warning to
+        # one line per distinct value.
+        self._tenant_running_counts: dict[str, int] = {}
+        self._tenant_warned: set[str] = set()
+        # Fairness-driven preemptions performed this step; bounded by config.
+        self._tenant_preemptions_this_step = 0
+        # Tenants already reported for overrunning the reclaim window.
+        self._tenant_starvation_reported: set[str] = set()
+        # Per-step running-slot budget, recomputed when tenants or their
+        # running counts change within a step.
+        self._tenant_slot_budget_cache: dict[str, int] = {}
+        self._tenant_slot_budget_key: tuple = ()
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -410,11 +446,13 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.scheduler_reserve_full_isl
         )
         # Cache-aware admission needs a prefix cache to consult, and reorders by
-        # position, which only a FCFS queue has.
+        # position, which only a flat FCFS queue has. Under per-tenant queues the
+        # tenant order must win, so the window is disabled.
         self.cache_aware_window = (
             self.scheduler_config.cache_aware_admission_window
             if self.policy == SchedulingPolicy.FCFS
             and self.cache_config.enable_prefix_caching
+            and not self.tenant_enabled
             else 0
         )
         self.cache_aware_threshold = (
@@ -701,6 +739,8 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.tenant_ledger is not None:
+            self._tenant_begin_step()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -751,6 +791,18 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # Fair-share enforcement: before anything is scheduled this step, bring
+        # running slots back in line with the tenant slot budget and give a
+        # starved tenant a slot. Doing it here, at the top, means no request has
+        # KV blocks allocated for this step yet, so the normal preemption
+        # bookkeeping (block free, ledger decrement) is exactly correct and no
+        # in-flight request is disturbed.
+        if self.tenant_ledger is not None:
+            # These preemptions are deliberately not added to `preempted_reqs`:
+            # that list suppresses the waiting scan, which would block the very
+            # tenant this reclaim exists to admit.
+            self._tenant_fairness_preempt(scheduled_timestamp)
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -938,6 +990,12 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
+                            if self.tenant_ledger is not None:
+                                # The preempted request no longer runs this
+                                # step, so give its service back to the ledger.
+                                self.tenant_ledger.record_pending(
+                                    preempted_req.tenant_id, -restored
+                                )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -988,6 +1046,11 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if self.tenant_ledger is not None:
+                # Account at the scheduling decision, so several running
+                # requests admitted in this step are ordered fairly against
+                # each other and the reported shares match this step.
+                self._tenant_note_scheduled(request, num_new_tokens)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -1097,6 +1160,15 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if self.tenant_ledger is not None and not self._tenant_may_admit(
+                    request
+                ):
+                    # This tenant is at its running quota or has used up its
+                    # slot budget for this step. Defer it; other tenants may
+                    # still admit their own requests from their queues.
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1596,6 +1668,10 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
+                if self.tenant_ledger is not None:
+                    self._tenant_running_counts[request.tenant_id] = (
+                        self._tenant_running_counts.get(request.tenant_id, 0) + 1
+                    )
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
@@ -1618,6 +1694,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if self.tenant_ledger is not None:
+                    self._tenant_note_scheduled(request, num_new_tokens)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1682,6 +1760,9 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_running_reqs) <= len(
             self.running
         )
+
+        if self.tenant_ledger is not None:
+            self._tenant_end_step()
 
         # Construct the scheduler output.
         new_reqs_data = [
@@ -1813,6 +1894,7 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._tenant_preemptions_this_step = 0
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1844,6 +1926,14 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.tenant_ledger is not None:
+            # The request leaves RUNNING here; its KV is freed below, so no
+            # cache is retained and the freed share is visible next step.
+            count = self._tenant_running_counts.get(request.tenant_id, 0)
+            if count <= 1:
+                self._tenant_running_counts.pop(request.tenant_id, None)
+            else:
+                self._tenant_running_counts[request.tenant_id] = count - 1
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._free_request_blocks(request)
@@ -2823,7 +2913,240 @@ class Scheduler(SchedulerInterface):
             or request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
         )
 
+    def _assign_tenant(self, request: Request) -> None:
+        """Resolve and validate the request's tenant exactly once.
+
+        The identifier is the one carried by the request; it is never derived
+        from the request id or from arrival order. A missing, malformed, or
+        unconfigured identifier routes the request to the default group and is
+        logged once per distinct value. Only the identifier and counts are
+        logged: never prompt content or the request body.
+        """
+        assert self.tenant_ledger is not None
+        tenant, accepted = resolve_tenant(request.tenant_id, self.tenant_config)
+        if (
+            not accepted
+            and request.tenant_id
+            and request.tenant_id not in self._tenant_warned
+        ):
+            self._tenant_warned.add(request.tenant_id)
+            logger.warning(
+                "Tenant identifier %r on request %s is not accepted "
+                "(malformed or not configured); serving it from the "
+                "default group %r.",
+                request.tenant_id,
+                request.request_id,
+                self.tenant_config.default_group,
+            )
+        request.tenant_id = tenant
+
+    def _tenant_begin_step(self) -> None:
+        """Refresh the ledger's view of which tenants have work this step."""
+        assert self.tenant_ledger is not None
+        ledger = self.tenant_ledger
+        ledger.begin_step(self.current_step)
+        active = {t for t, n in self._tenant_running_counts.items() if n}
+        active.update(t for t, n in self._tenant_queue_counts().items() if n)
+        ledger.set_active_tenants(active)
+
+    def _tenant_queue_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for queue in (self.waiting, self.kv_holding_waiting, self.async_kv_waiting):
+            if isinstance(queue, TenantRequestQueue):
+                for tenant in queue.queued_tenants():
+                    counts[tenant] = counts.get(tenant, 0) + queue.tenant_len(tenant)
+        # A request skipped during the waiting scan is briefly held in
+        # `deferred_waiting` rather than its tenant queue. Count those too, or a
+        # starved tenant whose request keeps getting skipped would look like it
+        # had nothing to run and would never trigger preemption.
+        for request in self.deferred_waiting:
+            counts[request.tenant_id] = counts.get(request.tenant_id, 0) + 1
+        return counts
+
+    def _tenant_note_scheduled(self, request: Request, num_tokens: int) -> None:
+        """Account tokens scheduled this step against the tenant ledger."""
+        if self.tenant_ledger is None:
+            return
+        self.tenant_ledger.record_pending(request.tenant_id, num_tokens)
+
+    def _tenant_refresh_running(self) -> None:
+        """Recompute running-request counts per tenant after a step."""
+        counts: dict[str, int] = {}
+        for request in self.running:
+            counts[request.tenant_id] = counts.get(request.tenant_id, 0) + 1
+        self._tenant_running_counts = counts
+
+    def _tenant_slot_budget(self) -> dict[str, int]:
+        """Per-tenant running-slot budget for this step, computed once.
+
+        Reused across the admission loop, which can peek hundreds of requests.
+        Rebuilt if the active set or running counts changed underneath it
+        (preemption at the top of the step, or a quota-driven deferral), so the
+        budget always reflects the current tenants.
+        """
+        signature = (
+            self.current_step,
+            self.tenant_ledger.version if self.tenant_ledger else 0,
+            tuple(sorted(self._tenant_running_counts.items())),
+        )
+        if signature == self._tenant_slot_budget_key:
+            return self._tenant_slot_budget_cache
+        ledger = self.tenant_ledger
+        assert ledger is not None
+        budget = ledger.slot_budget(self.max_num_running_reqs)
+        # A tenant with queued work always gets at least one slot, so it can
+        # make progress even when its share rounds to zero slots.
+        queued = self._tenant_queue_counts()
+        for tenant in budget:
+            if queued.get(tenant) and budget[tenant] == 0:
+                budget[tenant] = 1
+        self._tenant_slot_budget_cache = budget
+        self._tenant_slot_budget_key = signature
+        return budget
+
+    def _tenant_may_admit(self, request: Request) -> bool:
+        """Whether a waiting request may be admitted under the tenant policy.
+
+        Three rules, all read from the same ledger the metrics report from:
+
+        - A tenant never exceeds its configured running-request quota.
+        - A tenant never exceeds the whole running slots the ledger assigns it
+          for this step. Slot budgets sum to the running capacity and are
+          handed out so the least-served tenant gets any leftover slot, which
+          keeps per-tenant service within `share_tolerance` even when the
+          capacity does not divide evenly among tenants.
+        - Otherwise admission is governed by the ledger's ordering.
+        """
+        tenant = request.tenant_id
+        quota = self.tenant_config.quota_of(tenant)
+        if quota is not None and self._tenant_running_counts.get(tenant, 0) >= quota:
+            return False
+        ledger = self.tenant_ledger
+        assert ledger is not None
+        if not ledger.is_share_participant(tenant):
+            return True
+        budget = self._tenant_slot_budget().get(tenant, 0)
+        return self._tenant_running_counts.get(tenant, 0) < budget
+
+    def _tenant_fairness_preempt(self, scheduled_timestamp: float) -> None:
+        """Preempt a borrower so a starved tenant can run.
+
+        Called at the top of the step, before anything is scheduled, so the
+        preemption's block free and ledger updates are exactly correct. This is
+        what keeps per-tenant service within `share_tolerance` when there are
+        more tenants than running slots: without it, the tenants admitted first
+        would hold every slot and the rest would never run. It also returns a
+        returning lender's share without waiting for the borrower's requests to
+        finish.
+
+        At most `max_preemptions_per_step` requests are preempted per step, and
+        preemption frees the request's KV blocks (see `_preempt_request`), so no
+        cache is retained and the request is recomputed when it resumes.
+        """
+        ledger = self.tenant_ledger
+        assert ledger is not None
+        if self._tenant_preemptions_this_step >= (
+            self.tenant_config.max_preemptions_per_step
+        ):
+            return
+        counts: dict[str, int] = {}
+        for request in self.running:
+            counts[request.tenant_id] = counts.get(request.tenant_id, 0) + 1
+        # First, enforce the step's slot budget: a tenant holding more running
+        # slots than the ledger allotted it gives one back. This is what makes
+        # the whole-slot budget real when the capacity does not divide evenly
+        # among tenants -- the leftover slot moves to the tenant the budget
+        # assigns it to, instead of staying with whoever holds it.
+        budget = self._tenant_slot_budget()
+        # Only declared tenants take part in the slot budget. The default group
+        # has no share, so it must never be preempted for exceeding a budget it
+        # was never assigned (that would change its behavior from the original
+        # scheduler).
+        over = [
+            t
+            for t, n in counts.items()
+            if ledger.is_share_participant(t) and n > budget.get(t, 0)
+        ]
+        if over:
+            tenant = max(over, key=lambda t: (counts[t] - budget.get(t, 0), t))
+            candidates = [r for r in self.running if r.tenant_id == tenant]
+            if candidates:
+                candidates.sort(
+                    key=lambda r: (
+                        r.is_prefill_chunk,
+                        r.num_output_tokens,
+                        r.arrival_time,
+                    )
+                )
+                victim = candidates[0]
+                self.running.remove(victim)
+                self._preempt_request(victim, scheduled_timestamp)
+                self._tenant_preemptions_this_step += 1
+                return
+        starved = ledger.starving_tenant(counts, self._tenant_queue_counts())
+        if starved is None:
+            return
+        # Give natural request completion a chance to restore the balance
+        # before preempting. Reclaim is bounded by `reclaim_max_steps`; if it
+        # overruns, emit one observable event (tenant id and counts only) so an
+        # operator can see the window was missed rather than silently late.
+        if ledger.starvation_overdue(starved) and starved not in (
+            self._tenant_starvation_reported
+        ):
+            self._tenant_starvation_reported.add(starved)
+            logger.warning(
+                "Tenant %r has been over the share tolerance for %d steps "
+                "(limit %d) with %d queued and %d running; returning its share "
+                "by preemption.",
+                starved,
+                ledger.starvation_steps(starved),
+                self.tenant_config.reclaim_max_steps,
+                self._tenant_queue_counts().get(starved, 0),
+                counts.get(starved, 0),
+            )
+        borrower = ledger.borrower_to_preempt(counts)
+        if borrower is None or borrower == starved:
+            return
+        candidates = [r for r in self.running if r.tenant_id == borrower]
+        if not candidates:
+            return
+        # Interrupt a decode request before an in-progress prefill chunk, and
+        # among decodes the largest already-served request, so smaller requests
+        # and requests that have produced little output keep making progress.
+        candidates.sort(
+            key=lambda r: (r.is_prefill_chunk, r.num_output_tokens, r.arrival_time)
+        )
+        victim = candidates[0]
+        self.running.remove(victim)
+        self._preempt_request(victim, scheduled_timestamp)
+        self._tenant_preemptions_this_step += 1
+
+    def _tenant_end_step(self) -> None:
+        """Fold this step's service into the ledger and release empty tenants."""
+        if self.tenant_ledger is None:
+            return
+        self.tenant_ledger.commit_step()
+        self._tenant_refresh_running()
+        # A tenant that is no longer starved can report again if it relapses.
+        self._tenant_starvation_reported &= {
+            t
+            for t in self._tenant_starvation_reported
+            if self.tenant_ledger.starvation_steps(t) > 0
+        }
+        for queue in (self.waiting, self.kv_holding_waiting, self.async_kv_waiting):
+            if isinstance(queue, TenantRequestQueue):
+                queue.drop_empty()
+        # Release a tenant only once it has no work anywhere: no queued request
+        # in any queue, nothing deferred, and nothing running. Releasing on a
+        # single empty queue would drop a tenant that is still active.
+        queued = self._tenant_queue_counts()
+        for tenant in self.tenant_ledger.active_tenants():
+            if not queued.get(tenant) and not self._tenant_running_counts.get(tenant):
+                self.tenant_ledger.release_tenant(tenant)
+
     def _enqueue_waiting_request(self, request: Request) -> None:
+        if self.tenant_ledger is not None:
+            self._assign_tenant(request)
         if self._is_blocked_waiting_status(request.status):
             self.deferred_waiting.add(request)
         if self._holds_kv_blocks(request):
@@ -2888,6 +3211,13 @@ class Scheduler(SchedulerInterface):
         if not self.waiting:
             return async_kv
         async_head, head = async_kv.peek_request(), self.waiting.peek_request()
+        if self.tenant_ledger is not None:
+            # Compare the two heads' tenants first: a tenant owed share goes
+            # first regardless of which queue its request is in.
+            async_score = self.tenant_ledger.score(async_head.tenant_id)
+            head_score = self.tenant_ledger.score(head.tenant_id)
+            if async_score != head_score:
+                return async_kv if async_score < head_score else self.waiting
         if self.policy == SchedulingPolicy.PRIORITY:
             return async_kv if async_head < head else self.waiting
         return async_kv if async_head.arrival_time < head.arrival_time else self.waiting
@@ -3222,6 +3552,13 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.tenant_ledger is not None:
+            tenant = request.tenant_id
+            count = self._tenant_running_counts.get(tenant, 0)
+            if count <= 1:
+                self._tenant_running_counts.pop(tenant, None)
+            else:
+                self._tenant_running_counts[tenant] = count - 1
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
@@ -3474,6 +3811,9 @@ class Scheduler(SchedulerInterface):
         num_running, num_waiting = self.get_request_counts()
         num_deferred = len(self.deferred_waiting)
         num_preempted_reqs, self._num_preempted_reqs = self._num_preempted_reqs, 0
+        tenant_stats = (
+            self.tenant_ledger.snapshot() if self.tenant_ledger is not None else {}
+        )
         return SchedulerStats(
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
@@ -3489,6 +3829,7 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
+            tenant_stats=tenant_stats,
         )
 
     def make_spec_decoding_stats(

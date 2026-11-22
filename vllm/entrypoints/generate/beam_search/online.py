@@ -40,6 +40,7 @@ class BeamSearchOnlineMixin(ABC):
         session_id: str | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        tenant_id: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens
@@ -109,6 +110,7 @@ class BeamSearchOnlineMixin(ABC):
                             trace_headers=trace_headers,
                             session_id=session_id,
                             priority=priority,
+                            tenant_id=tenant_id,
                             data_parallel_rank=data_parallel_rank,
                         )
                     )

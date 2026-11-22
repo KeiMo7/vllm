@@ -16,6 +16,7 @@ from vllm.config import (
     ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
+    TenantConfig,
     VllmConfig,
 )
 from vllm.config.model import RunnerOption
@@ -99,6 +100,7 @@ def create_scheduler(
     lora_config: LoRAConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
     encoder_cache_size: int | None = None,
+    tenant_config: TenantConfig | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -230,6 +232,7 @@ def create_scheduler(
         observability_config=ObservabilityConfig(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
         ),
+        tenant_config=tenant_config if tenant_config is not None else TenantConfig(),
     )
     if kv_cache_layer_config is None:
         kv_cache_layer_config = full_layer(

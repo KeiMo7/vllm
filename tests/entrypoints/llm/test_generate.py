@@ -109,6 +109,53 @@ def test_single_prompt_priority(llm: LLM):
     assert len(outputs) == 1
 
 
+def test_tenant_identifiers_are_accepted(vllm_runner):
+    # The tenant argument is threaded from the offline API through the engine
+    # to the scheduler, which resolves it against the configured tenants.
+    with vllm_runner(
+        MODEL_NAME,
+        max_num_batched_tokens=4096,
+        gpu_memory_utilization=0.10,
+        enforce_eager=True,
+        tenant_config={
+            "enabled": True,
+            "tenants": [{"name": "team-a"}, {"name": "team-b"}],
+        },
+    ) as runner:
+        # One value applies to every prompt; a list is paired one by one.
+        outputs = runner.llm.generate(
+            PROMPTS, SamplingParams(max_tokens=4), tenant="team-a"
+        )
+        assert len(outputs) == len(PROMPTS)
+
+        tenants = ["team-a", "team-b", "team-a", "team-b"]
+        outputs = runner.llm.generate(
+            PROMPTS, SamplingParams(max_tokens=4), tenant=tenants
+        )
+        assert len(outputs) == len(PROMPTS)
+
+
+def test_unknown_tenant_is_served_from_default_group(vllm_runner):
+    # A request naming a tenant that is not configured still completes; it is
+    # served from the default group rather than rejected.
+    with vllm_runner(
+        MODEL_NAME,
+        max_num_batched_tokens=4096,
+        gpu_memory_utilization=0.10,
+        enforce_eager=True,
+        tenant_config={
+            "enabled": True,
+            "tenants": [{"name": "team-a"}, {"name": "team-b"}],
+        },
+    ) as runner:
+        outputs = runner.llm.generate(
+            PROMPTS, SamplingParams(max_tokens=4), tenant="not-configured"
+        )
+        assert len(outputs) == len(PROMPTS)
+        for output in outputs:
+            assert output.finished
+
+
 def test_max_model_len(vllm_runner):
     max_model_len = 20
     with vllm_runner(

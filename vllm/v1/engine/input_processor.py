@@ -379,6 +379,7 @@ class InputProcessor:
         resumable: bool = False,
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
+        tenant_id: str | None = None,
     ) -> EngineCoreRequest:
         watermarking = self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
@@ -561,6 +562,7 @@ class InputProcessor:
             lora_request=lora_request,
             cache_salt=decoder_input.get("cache_salt"),
             priority=priority,
+            tenant_id=tenant_id,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,

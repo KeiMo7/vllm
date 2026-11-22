@@ -144,6 +144,19 @@ completion = client.chat.completions.create(
 )
 ```
 
+The same APIs accept the `X-Vllm-Tenant-Id` request header to declare the
+tenant that owns the request when per-tenant fair-share scheduling is enabled
+(`--tenant-config`). See [Per-Tenant Fair-Share
+Scheduling](./tenant_scheduling.md) for the configuration and behavior.
+
+```python
+completion = client.chat.completions.create(
+    model="NousResearch/Meta-Llama-3-8B-Instruct",
+    messages=[{"role": "user", "content": "Hello!"}],
+    extra_headers={"X-Vllm-Tenant-Id": "team-a"},
+)
+```
+
 ## API Reference
 
 ### Completions API

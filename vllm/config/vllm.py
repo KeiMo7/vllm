@@ -58,6 +58,7 @@ from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
 from .speculative import SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
+from .tenant import TenantConfig
 from .utils import (
     CompileFactors,
     SupportsCompileFactors,
@@ -479,6 +480,8 @@ class VllmConfig:
     """Tokens after each block that its hash covers; 0 unless draft KV reads ahead."""
     watermark_config: WatermarkConfig | None = None
     """Text watermarking configuration."""
+    tenant_config: TenantConfig = Field(default_factory=TenantConfig)
+    """Per-tenant fair-share scheduling configuration."""
     diffusion_config: DiffusionConfig | None = None
     """Diffusion LLM (dLLM) configuration."""
 

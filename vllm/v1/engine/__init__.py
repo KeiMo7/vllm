@@ -211,6 +211,11 @@ class EngineCoreRequest(
     current_wave: int = 0
     priority: int = 0
 
+    # Tenant identifier carried by the request and already validated by the
+    # frontend. The scheduler resolves it against the configured tenant set;
+    # it never derives it from `request_id` or from arrival order.
+    tenant_id: str | None = None
+
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False
 
