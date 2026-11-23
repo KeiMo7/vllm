@@ -1,0 +1,41 @@
+{
+  "share_deviation": {
+    "scenario": "two tenants, weights 2:1, both backlogged, 60 steps",
+    "tokens_charged": {
+      "A": 448,
+      "B": 224
+    },
+    "share_A": 0.6666666666666666,
+    "expected_share_A": 0.6666666666666666,
+    "deviation": 0.0,
+    "threshold": 0.05,
+    "fairness_report": "/home/wll/uid70/reports/fairness_report.json"
+  },
+  "low_weight_wait": {
+    "scenario": "weights 4:1, H bursting, 8 low-weight requests",
+    "low_tenant_wait_rounds_max": 25,
+    "bound_rounds": 48,
+    "low_tenant_wait_seconds_max": 0.011388604000785563,
+    "low_tenant_requests_completed": 8
+  },
+  "replay_determinism": {
+    "scenario": "3 tenants, mixed priorities, fixed arrival sequence",
+    "steps": 50,
+    "identical": true
+  },
+  "single_tenant_throughput": {
+    "scenario": "single tenant, 60 identical requests",
+    "fcfs": {
+      "steps_to_drain": 75,
+      "scheduled_tokens": 300,
+      "wall_seconds": 0.005031950000557117
+    },
+    "fairshare": {
+      "steps_to_drain": 75,
+      "scheduled_tokens": 300,
+      "wall_seconds": 0.005499210999914794
+    },
+    "schedule_sequence_identical": true,
+    "scheduling_overhead_ratio": 1.0928588319251868
+  }
+}

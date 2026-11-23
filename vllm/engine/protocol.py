@@ -105,6 +105,7 @@ class EngineClient(ABC):
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
+        tenant_id: str | None = None,
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,

@@ -238,6 +238,7 @@ class LLMEngine:
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
+        tenant_id: str | None = None,
         session_id: str | None = None,
         prompt_text: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
@@ -280,6 +281,7 @@ class LLMEngine:
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
+                tenant_id=tenant_id,
                 session_id=session_id,
                 kv_hints=kv_hints,
             )

@@ -19,7 +19,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.model import RunnerOption
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import FairShareConfig, SchedulerPolicy
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -94,6 +94,7 @@ def create_scheduler(
     cache_aware_admission_window: int = 0,
     cache_aware_admission_threshold: float = 0.5,
     scheduling_policy: SchedulerPolicy = "fcfs",
+    fair_share: FairShareConfig | None = None,
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
     lora_config: LoRAConfig | None = None,
@@ -150,6 +151,7 @@ def create_scheduler(
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
         policy=scheduling_policy,
+        fair_share=fair_share if fair_share is not None else FairShareConfig(),
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -276,6 +278,9 @@ def create_requests(
     block_size: int = 16,
     req_ids: list[str] | None = None,
     sampling_params: SamplingParams | None = None,
+    tenant_ids: list[str | None] | None = None,
+    arrival_times: list[float] | None = None,
+    priorities: list[int] | None = None,
 ) -> list[Request]:
     global _none_hash_initialized
     if not _none_hash_initialized:
@@ -310,6 +315,12 @@ def create_requests(
         assert len(req_ids) == num_requests
     else:
         req_ids = [f"{i}" for i in range(num_requests)]
+    if tenant_ids:
+        assert len(tenant_ids) == num_requests
+    if arrival_times:
+        assert len(arrival_times) == num_requests
+    if priorities:
+        assert len(priorities) == num_requests
 
     for i in range(num_requests):
         mm_features = []
@@ -349,6 +360,9 @@ def create_requests(
             pooling_params=None,
             mm_features=mm_features if mm_features else None,
             block_hasher=block_hasher,
+            tenant_id=tenant_ids[i] if tenant_ids else None,
+            arrival_time=arrival_times[i] if arrival_times else None,
+            priority=priorities[i] if priorities else 0,
         )
         requests.append(request)
     return requests

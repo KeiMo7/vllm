@@ -45,6 +45,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.fair_share import TenantAccountant
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -236,15 +237,20 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        # Per-tenant fair-share accounting; None unless the fairshare policy
+        # is selected, in which case every waiting queue shares it.
+        self.fair_share: TenantAccountant | None = None
+        if self.policy == SchedulingPolicy.FAIRSHARE:
+            self.fair_share = TenantAccountant(self.scheduler_config.fair_share)
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = create_request_queue(self.policy, self.fair_share)
         # Waiting requests that hold KV blocks are always drained before
         # self.waiting: a block-holder must never sit behind a request whose
         # failed allocation would stop the scheduling scan.
-        self.kv_holding_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = create_request_queue(self.policy, self.fair_share)
         # With either async-load limit, keep requests that may load KV async
         # separate so throttling their loads doesn't block local requests.
-        self.async_kv_waiting = create_request_queue(self.policy)
+        self.async_kv_waiting = create_request_queue(self.policy, self.fair_share)
         # Waiting requests that are deferred, i.e. were skipped by the scheduling
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
@@ -749,6 +755,11 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        if self.fair_share is not None:
+            # Settle any elapsed accounting windows and reset per-step
+            # charge-undo state. Window settlement is accounting only and
+            # never feeds back into scheduling decisions.
+            self.fair_share.begin_step(scheduled_timestamp)
 
         self.kv_cache_manager.new_step_starts()
 
@@ -919,6 +930,13 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                    elif self.policy == SchedulingPolicy.FAIRSHARE:
+                        # Preempt from the tenant most over its share, so the
+                        # reclaimed capacity flows back to under-served
+                        # tenants. Only reached when allocation failed, i.e.
+                        # preemption remains a last resort.
+                        assert self.fair_share is not None
+                        preempted_req = self.fair_share.pick_victim(self.running)
                     else:
                         preempted_req = self.running[-1]
 
@@ -926,7 +944,10 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if self.policy in (
+                        SchedulingPolicy.PRIORITY,
+                        SchedulingPolicy.FAIRSHARE,
+                    ):
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -936,6 +957,10 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if self.fair_share is not None:
+                                # Reverse this step's charge of the victim:
+                                # its tokens will not run after all.
+                                self.fair_share.undo_charge(preempted_req)
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -970,7 +995,11 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 if (
-                    self.policy == SchedulingPolicy.PRIORITY
+                    self.policy
+                    in (
+                        SchedulingPolicy.PRIORITY,
+                        SchedulingPolicy.FAIRSHARE,
+                    )
                     and request.status == RequestStatus.PREEMPTED
                 ):
                     # The request was the lowest-priority running request and
@@ -988,6 +1017,12 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if self.fair_share is not None:
+                self.fair_share.charge_scheduled_tokens(
+                    request,
+                    num_new_tokens,
+                    request.num_computed_tokens + num_new_tokens,
+                )
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -1596,6 +1631,8 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
+                if self.fair_share is not None:
+                    self.fair_share.note_admission(request, self.current_step)
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
@@ -1622,6 +1659,12 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if self.fair_share is not None:
+                    self.fair_share.charge_scheduled_tokens(
+                        request,
+                        num_new_tokens,
+                        num_computed_tokens + num_new_tokens,
+                    )
                 self._set_kv_fetch_stage(request, None)
                 drafts_needed = drafts_needed or not self._drafts_unused(
                     request, num_computed_tokens, num_new_tokens
@@ -1875,6 +1918,9 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+        if self.fair_share is not None:
+            self.fair_share.note_preemption(request)
+            self.fair_share.note_enqueue(request, self.current_step)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -2659,8 +2705,13 @@ class Scheduler(SchedulerInterface):
             self.kv_holding_waiting.remove_requests(stopped_preempted_reqs)
             self.async_kv_waiting.remove_requests(stopped_preempted_reqs)
             self.deferred_waiting.difference_update(stopped_preempted_reqs)
+            if self.fair_share is not None:
+                for request in stopped_preempted_reqs:
+                    self.fair_share.note_dequeue(request.request_id)
         for request in continuing_reqs:
             self._enqueue_waiting_request(request)
+            if self.fair_share is not None:
+                self.fair_share.note_enqueue(request, self.current_step)
 
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
@@ -3131,6 +3182,8 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.fair_share is not None:
+                self.fair_share.note_new_request(request, self.current_step)
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3197,6 +3250,9 @@ class Scheduler(SchedulerInterface):
             self.kv_holding_waiting.remove_requests(waiting_requests_to_remove)
             self.async_kv_waiting.remove_requests(waiting_requests_to_remove)
             self.deferred_waiting.difference_update(waiting_requests_to_remove)
+            if self.fair_share is not None:
+                for request in waiting_requests_to_remove:
+                    self.fair_share.note_dequeue(request.request_id)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -3222,6 +3278,10 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.fair_share is not None:
+            # Catch-all for every finish path: drop any pending enqueue mark
+            # so the ledger never holds state for a dead request.
+            self.fair_share.note_dequeue(request.request_id)
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
@@ -3489,6 +3549,9 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
+            fair_share_stats=(
+                self.fair_share.snapshot() if self.fair_share is not None else None
+            ),
         )
 
     def make_spec_decoding_stats(

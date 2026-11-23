@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
@@ -17,7 +18,60 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "fairshare"]
+FairShareUnit = Literal["token", "request"]
+
+
+@config
+class FairShareConfig:
+    """Per-tenant weighted fair-share scheduling.
+
+    Only active when `SchedulerConfig.policy` is "fairshare". Tenants are
+    identified by a trusted identifier carried on the request (`tenant_id`,
+    populated by the serving layer from an authenticated channel); requests
+    without one are accounted under a default tenant, never silently dropped.
+    """
+
+    tenant_weights: dict[str, float] = Field(default_factory=dict)
+    """Fair-share weight of each tenant. Shares of compute are divided in
+    proportion to these weights among the tenants with outstanding demand;
+    idle tenants lend their share to the others. Every weight must be
+    positive."""
+
+    default_tenant_weight: float = Field(default=1.0, gt=0)
+    """Weight of the default tenant that collects requests without a tenant
+    identifier."""
+
+    share_unit: FairShareUnit = "token"
+    """Unit that shares are accounted in:
+
+    - "token": each tenant is charged per computed token, so long requests
+      cost more share than short ones.
+    - "request": each tenant is charged once per admitted request, so every
+      request costs the same share regardless of length."""
+
+    tenant_min_shares: dict[str, float] = Field(default_factory=dict)
+    """Reserved minimum share per tenant, as a fraction of capacity in
+    `[0, 1)`; the values must sum to at most 1. A backlogged tenant whose
+    recent usage is below its reservation is admitted ahead of the weighted
+    order. Reservations must not exceed the share implied by
+    `tenant_weights`; unused reservations are borrowed by other tenants."""
+
+    reservation_window_tokens: int = Field(default=8192, ge=1)
+    """Size of the deterministic sliding window (in charged units — tokens,
+    or requests when `share_unit` is "request") over which recent usage is
+    compared against `tenant_min_shares`."""
+
+    window_size_seconds: float = Field(default=60.0, gt=0)
+    """Length of the accounting window used for settlement reports. Usage is
+    settled per window and never carried across windows. Accounting only;
+    does not affect scheduling decisions."""
+
+    priority_aging_seconds: float = Field(default=10.0, ge=0)
+    """Interval after which a waiting request's effective priority improves
+    by one band, so low-priority requests cannot be delayed indefinitely
+    when `Request.priority` is combined with fair-share weights. 0 disables
+    aging (strict priority bands)."""
 
 
 @config
@@ -195,10 +249,17 @@ class SchedulerConfig:
     policy: SchedulerPolicy = "fcfs"
     """The scheduling policy to use:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "fairshare" means compute is divided across tenants in proportion to
+      their configured weights (see `fair_share`), with bounded waiting for
+      every tenant regardless of arrival order."""
+
+    fair_share: FairShareConfig = Field(default_factory=FairShareConfig)
+    """Configuration of per-tenant weighted fair-share scheduling. Only used
+    when `policy` is "fairshare"."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -352,6 +413,7 @@ class SchedulerConfig:
             "max_num_encoder_input_tokens",
             "encoder_cache_size",
             "policy",
+            "fair_share",
             "disable_chunked_mm_input",
             "scheduler_cls",
             "disable_hybrid_kv_cache_manager",
@@ -391,6 +453,41 @@ class SchedulerConfig:
             )
 
         self.verify_max_model_len(max_model_len)
+        self._verify_fair_share()
+
+    def _verify_fair_share(self) -> None:
+        """Validate fair-share config; refuse to start on invalid weights.
+
+        Only enforced when the fairshare policy is selected, so existing
+        fcfs/priority deployments are unaffected.
+        """
+        if self.policy != "fairshare":
+            return
+        fs = self.fair_share
+        for tenant, weight in fs.tenant_weights.items():
+            if not math.isfinite(weight) or weight <= 0:
+                raise ValueError(
+                    f"fair_share.tenant_weights[{tenant!r}] must be a "
+                    f"positive finite number, got {weight}."
+                )
+        total_reserved = 0.0
+        for tenant, share in fs.tenant_min_shares.items():
+            if tenant not in fs.tenant_weights:
+                raise ValueError(
+                    f"fair_share.tenant_min_shares[{tenant!r}] has no "
+                    "corresponding entry in fair_share.tenant_weights."
+                )
+            if not 0.0 <= share < 1.0:
+                raise ValueError(
+                    f"fair_share.tenant_min_shares[{tenant!r}] must be in "
+                    f"[0, 1), got {share}."
+                )
+            total_reserved += share
+        if total_reserved > 1.0:
+            raise ValueError(
+                "fair_share.tenant_min_shares must sum to at most 1, "
+                f"got {total_reserved}."
+            )
 
     def verify_max_model_len(self, max_model_len: int) -> Self:
         if (

@@ -210,6 +210,10 @@ class EngineCoreRequest(
     # a wave finished notification is received.
     current_wave: int = 0
     priority: int = 0
+    # Trusted tenant identifier for fair-share scheduling, populated by the
+    # serving layer from an authenticated channel (never inferred from the
+    # request content). None means the default tenant.
+    tenant_id: str | None = None
 
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False

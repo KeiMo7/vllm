@@ -36,6 +36,10 @@ logger = init_logger(__name__)
 _T = TypeVar("_T")
 SESSION_ID_HEADER = "X-Session-ID"
 PRIORITY_HEADER = "X-Vllm-Priority"
+# Trusted tenant identifier for fair-share scheduling. Deployments must
+# terminate authentication in front of vLLM and have the trusted gateway set
+# this header; it is never read from the request body.
+TENANT_ID_HEADER = "X-Vllm-Tenant-Id"
 
 
 def build_per_request_timing_metrics(
@@ -257,6 +261,20 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
                         )
                     return value
         return request.priority
+
+    @staticmethod
+    def _get_tenant_id(raw_request: Request | None) -> str | None:
+        """Tenant identity from the trusted gateway header only.
+
+        The tenant id is deliberately not read from the request body: it
+        must come from a channel the deployment controls (an authenticated
+        gateway setting `X-Vllm-Tenant-Id`), so clients cannot pick their
+        own share class. Requests without the header fall back to the
+        default tenant in the scheduler."""
+        if raw_request is None:
+            return None
+        tenant_id = raw_request.headers.get(TENANT_ID_HEADER)
+        return tenant_id or None
 
     async def _with_kv_transfer_rejection_cleanup(
         self,

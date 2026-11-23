@@ -75,6 +75,7 @@ class Request:
         lora_request: "LoRARequest | None" = None,
         cache_salt: str | None = None,
         priority: int = 0,
+        tenant_id: str | None = None,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
@@ -88,6 +89,14 @@ class Request:
         self.request_id = request_id
         self.client_index = client_index
         self.priority = priority
+        # Trusted tenant identifier for fair-share scheduling, supplied by
+        # the serving layer from an authenticated channel. None/empty means
+        # the request is accounted under the default tenant.
+        self.tenant_id = tenant_id or None
+        # High-water mark of token positions already charged to the tenant,
+        # so recomputation after a preemption is not charged twice. Owned by
+        # the fair-share accountant; None until the first charge.
+        self.fair_share_charged_upto: int | None = None
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request
@@ -278,6 +287,7 @@ class Request:
             lora_request=request.lora_request,
             cache_salt=request.cache_salt,
             priority=request.priority,
+            tenant_id=request.tenant_id,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             resumable=request.resumable,

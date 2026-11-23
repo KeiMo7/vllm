@@ -259,6 +259,10 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Per-tenant fair-share accounting snapshot; only set when the
+    # "fairshare" scheduling policy is active.
+    fair_share_stats: dict[str, Any] | None = None
+
 
 @dataclass(slots=True)
 class RequestStateStats:

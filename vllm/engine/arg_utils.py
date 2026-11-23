@@ -113,7 +113,7 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import FairShareConfig, SchedulerPolicy
 from vllm.config.utils import get_field, replace
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.config.watermarking import WatermarkConfig
@@ -750,6 +750,7 @@ class EngineArgs:
     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    fair_share: FairShareConfig = get_field(SchedulerConfig, "fair_share")
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
@@ -1776,6 +1777,7 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
+        scheduler_group.add_argument("--fair-share", **scheduler_kwargs["fair_share"])
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
@@ -2687,6 +2689,7 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            fair_share=self.fair_share,
             scheduler_cls=self.scheduler_cls,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             long_prefill_token_threshold_adaptive=(

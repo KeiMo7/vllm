@@ -79,7 +79,9 @@ For each item, its support in vLLM V1 falls into one of the following states:
 The V1 scheduler supports multiple scheduling policies, including First-Come,
 First-Served (FCFS) and priority-based scheduling (where requests are processed
 based on assigned priority, with FCFS as a tie-breaker), configurable via the
-`--scheduling-policy` argument.
+`--scheduling-policy` argument. A third policy, `fairshare`, divides compute
+across tenants in proportion to configured per-tenant weights; see
+[Fair-Share Scheduling](../serving/fair_share_scheduling.md).
 
 ### Hardware
 

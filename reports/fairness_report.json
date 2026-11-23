@@ -1,0 +1,80 @@
+{
+  "share_unit": "token",
+  "window_size_seconds": 0.02,
+  "num_defaulted_requests": 0,
+  "total_charged": 672,
+  "tenants": {
+    "A": {
+      "weight": 2.0,
+      "expected_share": 0.6666666666666666,
+      "actual_share": 0.6666666666666666,
+      "share_deviation": 0.0,
+      "tokens": 448,
+      "requests_admitted": 32,
+      "preemptions": 0,
+      "wait": {
+        "count": 32,
+        "mean_seconds": 0.002748149843853298,
+        "max_seconds": 0.004857195999647956,
+        "max_rounds": 56,
+        "bucket_edges_seconds": [
+          0.01,
+          0.05,
+          0.1,
+          0.5,
+          1.0,
+          5.0,
+          10.0,
+          60.0
+        ],
+        "buckets": [
+          32,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "B": {
+      "weight": 1.0,
+      "expected_share": 0.3333333333333333,
+      "actual_share": 0.3333333333333333,
+      "share_deviation": 0.0,
+      "tokens": 224,
+      "requests_admitted": 16,
+      "preemptions": 0,
+      "wait": {
+        "count": 16,
+        "mean_seconds": 0.0025262013748488243,
+        "max_seconds": 0.004766213999573665,
+        "max_rounds": 56,
+        "bucket_edges_seconds": [
+          0.01,
+          0.05,
+          0.1,
+          0.5,
+          1.0,
+          5.0,
+          10.0,
+          60.0
+        ],
+        "buckets": [
+          16,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  }
+}
