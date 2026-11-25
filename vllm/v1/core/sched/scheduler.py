@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -79,6 +79,7 @@ from vllm.v1.metrics.stats import (
     KV_FETCH_STAGES,
     KV_FETCH_WAITING_TO_START,
     PrefixCacheStats,
+    PrefixFairAdmissionStats,
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
@@ -91,6 +92,34 @@ from vllm.v1.token_buffer import extend_from_slice
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class AdmissionTicket:
+    """Per-request arbitration state for fair prefix-cache admission.
+
+    Tickets live exactly as long as the request's entry in
+    `Scheduler.requests` from the scheduler's perspective: inserted by
+    `add_request`, dropped immediately by `_free_request`.
+    """
+
+    enqueue_step: int
+    """Scheduler step at which the request was enqueued; breaks release ties."""
+
+    deferred_steps: int = 0
+    """Consecutive arbitration ticks the request has been held behind a
+    strictly higher-scored candidate; reset on fairness release."""
+
+    promotions: int = 0
+    """Number of times this request's candidate position actually moved
+    forward due to arbitration."""
+
+    last_probe_tokens: int = 0
+    """Cached-prefix score from the last successful probe (block aligned)."""
+
+    probe_valid: bool = False
+    """Whether `last_probe_tokens` reflects the current prefix cache state;
+    invalidated by preemption and prefix-cache resets."""
 
 
 class Scheduler(SchedulerInterface):
@@ -419,6 +448,38 @@ class Scheduler(SchedulerInterface):
         )
         self.cache_aware_threshold = (
             self.scheduler_config.cache_aware_admission_threshold
+        )
+
+        # Fair prefix admission shares the FCFS + prefix-cache preconditions of
+        # cache-aware admission. Record the first failing precondition in a
+        # fixed priority order so the inactive state is observable.
+        if self.policy != SchedulingPolicy.FCFS:
+            self.fair_admission_window = 0
+            self.fair_admission_inactive_reason = "priority_policy"
+        elif not self.cache_config.enable_prefix_caching:
+            self.fair_admission_window = 0
+            self.fair_admission_inactive_reason = "prefix_caching_disabled"
+        elif self.scheduler_config.prefix_fair_admission_window == 0:
+            self.fair_admission_window = 0
+            self.fair_admission_inactive_reason = "disabled"
+        else:
+            self.fair_admission_window = (
+                self.scheduler_config.prefix_fair_admission_window
+            )
+            self.fair_admission_inactive_reason = ""
+        self.fair_admission_deadline = (
+            self.scheduler_config.prefix_fair_admission_deadline_steps
+        )
+        self.fair_admission_probe_budget = min(
+            self.scheduler_config.prefix_fair_admission_probe_budget,
+            self.fair_admission_window,
+        )
+        # Request id -> arbitration ticket. Keys stay a subset of
+        # self.requests at all times; see AdmissionTicket.
+        self._admission_tickets: dict[str, AdmissionTicket] = {}
+        # Windowed counters consumed and reset by make_stats().
+        self._fair_admission_stats = PrefixFairAdmissionStats(
+            inactive_reason=self.fair_admission_inactive_reason
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
@@ -1039,8 +1100,13 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
-            if self.cache_aware_window and not defer_prefills:
-                self._reorder_waiting_by_cached_prefix()
+            if not defer_prefills:
+                # The two admission windows are mutually exclusive by config
+                # validation; keep the branches separate and ordered.
+                if self.cache_aware_window:
+                    self._reorder_waiting_by_cached_prefix()
+                elif self.fair_admission_window:
+                    self._reorder_waiting_by_fair_cached_prefix()
 
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
@@ -1852,6 +1918,13 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        # Preemption frees the request's blocks, so any probed prefix is no
+        # longer authoritative. Keep deferral debt: preemption is not a fresh
+        # enqueue and must not reset the fairness bound.
+        ticket = self._admission_tickets.get(request.request_id)
+        if ticket is not None:
+            ticket.probe_valid = False
+            ticket.last_probe_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2880,6 +2953,168 @@ class Scheduler(SchedulerInterface):
         for request in reversed(reordered):
             self.waiting.prepend_request(request)
 
+    def _fair_candidate_slots(self, head: list[Request]) -> list[int]:
+        """Indices of plain, zero-compute, block-free waiting requests."""
+        return [
+            i
+            for i, request in enumerate(head)
+            if request.status == RequestStatus.WAITING
+            and request.num_computed_tokens == 0
+            and not self._holds_kv_blocks(request)
+        ]
+
+    def _reorder_waiting_by_fair_cached_prefix(self) -> None:
+        """Prefix-score reordering with a verifiable deferral deadline.
+
+        Candidate slots are permuted among themselves exactly like
+        `_reorder_waiting_by_cached_prefix`: preempted, remote-KV and
+        partially computed requests keep their indices and no candidate moves
+        past them. On top of score ordering, every candidate deferred behind a
+        strictly higher score accumulates debt; once debt reaches the
+        configured deadline the candidate is released to the front of the
+        candidate slots and its debt resets.
+
+        Complexity is linearithmic in the window only: at most
+        `fair_admission_probe_budget` read-only probes and no scan of the full
+        waiting queue beyond the single batched `remove_requests` pass.
+        """
+        if self.fair_admission_window == 0 or len(self.waiting) < 2:
+            return
+
+        window_size = min(self.fair_admission_window, len(self.waiting))
+        head = list(itertools.islice(self.waiting, window_size))
+        slots = self._fair_candidate_slots(head)
+        if len(slots) < 2:
+            return
+
+        stats = self._fair_admission_stats
+        stats.steps += 1
+        budget = self.fair_admission_probe_budget
+
+        # Probe budget is spent in arrival order, a total order independent of
+        # any previous reordering of self.waiting.
+        arrival_order = sorted(
+            slots,
+            key=lambda i: (head[i].arrival_time, head[i].request_id),
+        )
+        scores: dict[str, int] = {}
+        probes_used = 0
+        for slot in arrival_order:
+            request = head[slot]
+            request_id = request.request_id
+            ticket = self._admission_tickets.get(request_id)
+            if probes_used >= budget:
+                # Unprobed candidates participate with a zero score.
+                scores[request_id] = 0
+                stats.probe_budget_exhausted += 1
+                continue
+            probes_used += 1
+            stats.probes += 1
+            try:
+                score = self.kv_cache_manager.get_num_cached_tokens(request)
+            except (RuntimeError, KeyError, ValueError):
+                # Degrade this request to a zero score without disrupting the
+                # rest of the window or schedule(). A constant message keeps
+                # warning_once deduplication effective across request ids.
+                stats.probe_errors += 1
+                logger.warning_once(
+                    "Fair prefix admission probe failed; treating the "
+                    "request as a cache miss for this step."
+                )
+                scores[request_id] = 0
+                if ticket is not None:
+                    ticket.probe_valid = False
+                    ticket.last_probe_tokens = 0
+                continue
+            scores[request_id] = score
+            if ticket is not None:
+                ticket.last_probe_tokens = score
+                ticket.probe_valid = True
+
+        # State can change while probing only if a probe implementation or a
+        # test double mutates the request. Re-judge against current state and
+        # abandon the reorder rather than moving a now-fixed slot.
+        current_slots = self._fair_candidate_slots(head)
+        if {head[i].request_id for i in current_slots} != {
+            head[i].request_id for i in slots
+        }:
+            return
+
+        max_score = max(scores[head[i].request_id] for i in slots)
+
+        # Accumulate deferral debt. A candidate ranks behind a strictly higher
+        # score iff its own score is below the window maximum.
+        due: list[int] = []
+        for slot in slots:
+            request = head[slot]
+            ticket = self._admission_tickets.get(request.request_id)
+            if ticket is None:
+                continue
+            if scores[request.request_id] < max_score:
+                ticket.deferred_steps += 1
+                stats.deferrals += 1
+                stats.max_deferred_steps = max(
+                    stats.max_deferred_steps, ticket.deferred_steps
+                )
+            if ticket.deferred_steps >= self.fair_admission_deadline:
+                due.append(slot)
+
+        if due:
+            # One release round for this arbitration step. Debt is reset even
+            # when the resulting permutation performs no actual exchange.
+            stats.fairness_releases += 1
+            due_set = set(due)
+            for slot in due:
+                ticket = self._admission_tickets[head[slot].request_id]
+                ticket.deferred_steps = 0
+            released_order = sorted(
+                due,
+                key=lambda i: (
+                    self._admission_tickets[head[i].request_id].enqueue_step,
+                    head[i].arrival_time,
+                    head[i].request_id,
+                ),
+            )
+        else:
+            due_set = set()
+            released_order = []
+
+        # Score order for every non-released candidate, with arrival total
+        # order breaking ties.
+        scored_order = sorted(
+            (i for i in slots if i not in due_set),
+            key=lambda i: (
+                -scores[head[i].request_id],
+                head[i].arrival_time,
+                head[i].request_id,
+            ),
+        )
+        new_slot_order = released_order + scored_order
+
+        # Count only candidates whose rank among candidate slots actually
+        # decreases (moves forward).
+        old_rank = {slot: rank for rank, slot in enumerate(slots)}
+        for new_rank, slot in enumerate(new_slot_order):
+            if new_rank < old_rank[slot]:
+                stats.promotions += 1
+                ticket = self._admission_tickets.get(head[slot].request_id)
+                if ticket is not None:
+                    ticket.promotions += 1
+
+        reordered = list(head)
+        for slot, source in zip(slots, new_slot_order):
+            reordered[slot] = head[source]
+
+        if reordered == head:
+            # No actual exchange; release accounting above still happened.
+            return
+
+        # One pass to drop the whole window, then re-insert in the new order;
+        # removing each request individually would be quadratic.
+        self.waiting.remove_requests(head)
+        for request in reversed(reordered):
+            self.waiting.prepend_request(request)
+
     def _next_waiting_queue(self, take_async_kv: bool) -> RequestQueue:
         """self.waiting or self.async_kv_waiting, whichever head goes first."""
         async_kv = self.async_kv_waiting
@@ -3131,6 +3366,11 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            # Tickets are created regardless of whether fair admission is
+            # active so their lifecycle can be asserted under any config.
+            self._admission_tickets[request.request_id] = AdmissionTicket(
+                enqueue_step=self.current_step
+            )
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3222,6 +3462,10 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        # Drop arbitration state immediately, even when KV block freeing is
+        # deferred, so no dangling ticket key can outlive finish_requests().
+        self._admission_tickets.pop(request.request_id, None)
+
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
@@ -3254,6 +3498,9 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        # Normally already removed by _free_request(); keep the invariant
+        # `set(_admission_tickets) <= set(requests)` on any direct path too.
+        self._admission_tickets.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     @property
@@ -3406,8 +3653,14 @@ class Scheduler(SchedulerInterface):
         if reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
 
-        if reset_successful and self.aux_output_connector is not None:
-            self.aux_output_connector.reset()
+        if reset_successful:
+            # Cached probe scores are stale after a reset; invalidate only the
+            # probe result and preserve deferral/promotion/enqueue debt.
+            for ticket in self._admission_tickets.values():
+                ticket.probe_valid = False
+                ticket.last_probe_tokens = 0
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.reset()
 
         return reset_successful
 
@@ -3474,6 +3727,7 @@ class Scheduler(SchedulerInterface):
         num_running, num_waiting = self.get_request_counts()
         num_deferred = len(self.deferred_waiting)
         num_preempted_reqs, self._num_preempted_reqs = self._num_preempted_reqs, 0
+        fair_admission_stats = self._consume_fair_admission_stats()
         return SchedulerStats(
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
@@ -3483,6 +3737,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
+            prefix_fair_admission_stats=fair_admission_stats,
             kv_cache_eviction_events=eviction_events,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
@@ -3490,6 +3745,30 @@ class Scheduler(SchedulerInterface):
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
         )
+
+    def _consume_fair_admission_stats(self) -> PrefixFairAdmissionStats:
+        """Snapshot window counters and reset them for the next window."""
+        current = self._fair_admission_stats
+        snapshot = PrefixFairAdmissionStats(
+            steps=current.steps,
+            promotions=current.promotions,
+            deferrals=current.deferrals,
+            max_deferred_steps=current.max_deferred_steps,
+            fairness_releases=current.fairness_releases,
+            probes=current.probes,
+            probe_budget_exhausted=current.probe_budget_exhausted,
+            probe_errors=current.probe_errors,
+            inactive_reason=self.fair_admission_inactive_reason,
+        )
+        current.steps = 0
+        current.promotions = 0
+        current.deferrals = 0
+        current.max_deferred_steps = 0
+        current.fairness_releases = 0
+        current.probes = 0
+        current.probe_budget_exhausted = 0
+        current.probe_errors = 0
+        return snapshot
 
     def make_spec_decoding_stats(
         self,

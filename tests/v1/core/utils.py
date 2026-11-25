@@ -99,6 +99,9 @@ def create_scheduler(
     lora_config: LoRAConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
     encoder_cache_size: int | None = None,
+    prefix_fair_admission_window: int = 0,
+    prefix_fair_admission_deadline_steps: int = 16,
+    prefix_fair_admission_probe_budget: int = 8,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -147,6 +150,9 @@ def create_scheduler(
         is_encoder_decoder=model_config.is_encoder_decoder,
         cache_aware_admission_window=cache_aware_admission_window,
         cache_aware_admission_threshold=cache_aware_admission_threshold,
+        prefix_fair_admission_window=prefix_fair_admission_window,
+        prefix_fair_admission_deadline_steps=prefix_fair_admission_deadline_steps,
+        prefix_fair_admission_probe_budget=prefix_fair_admission_probe_budget,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
         policy=scheduling_policy,

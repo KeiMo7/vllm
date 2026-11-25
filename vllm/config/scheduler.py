@@ -267,6 +267,34 @@ class SchedulerConfig:
     no benefit. It also means the per-request cache probe is skipped entirely
     while the cache is roomy. Set to 0.0 to reorder on every step."""
 
+    prefix_fair_admission_window: int = Field(default=0, ge=0)
+    """Look-ahead window for fair prefix-cache admission. Within the first N
+    waiting requests, requests with a deeper cached prefix may be admitted
+    first, but every request that keeps being deferred is guaranteed admission
+    once its deferral debt reaches
+    `prefix_fair_admission_deadline_steps`. 0 (the default) disables fair
+    admission and leaves admission in strict arrival order.
+
+    Unlike `cache_aware_admission_window`, this reordering also tracks deferral
+    debt and periodically releases long-deferred requests to the front of the
+    candidate slots. The two windows are mutually exclusive: setting both to a
+    positive value raises `ValueError`. Requires prefix caching and the "fcfs"
+    policy; it is ignored otherwise."""
+
+    prefix_fair_admission_deadline_steps: int = Field(default=16, ge=1)
+    """Maximum number of arbitration steps a request can stay deferred before
+    it is released to the front of the candidate slots. Once a request's
+    `deferred_steps` reaches this value, the next arbitration releases it and
+    resets its debt, giving every miss request a verifiable waiting bound."""
+
+    prefix_fair_admission_probe_budget: int = Field(default=8, ge=0)
+    """Maximum number of prefix-cache probes issued per arbitration step.
+    Requests beyond the budget are scored as 0 for that step and counted as
+    budget-exhausted. 0 disables probing entirely, so ordering degrades to
+    arrival order. When this exceeds
+    `prefix_fair_admission_window`, the effective value is their minimum; this
+    is clamped silently rather than rejected."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -360,6 +388,9 @@ class SchedulerConfig:
             "prefill_schedule_interval",
             "async_scheduling",
             "stream_interval",
+            "prefix_fair_admission_window",
+            "prefix_fair_admission_deadline_steps",
+            "prefix_fair_admission_probe_budget",
         }
         return get_compile_factors(self, ignored_factors)
 
@@ -389,6 +420,25 @@ class SchedulerConfig:
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
                 self.max_num_batched_tokens,
             )
+
+        if (
+            self.prefix_fair_admission_window > 0
+            and self.cache_aware_admission_window > 0
+        ):
+            raise ValueError(
+                "prefix_fair_admission_window and "
+                "cache_aware_admission_window are mutually exclusive; set at "
+                "most one to a positive value."
+            )
+        # A probe can only target a request inside the arbitration window, so
+        # a budget larger than a positive window never buys extra probes. Keep
+        # the documented budget default untouched while the window is 0.
+        if (
+            0
+            < self.prefix_fair_admission_window
+            < self.prefix_fair_admission_probe_budget
+        ):
+            self.prefix_fair_admission_probe_budget = self.prefix_fair_admission_window
 
         self.verify_max_model_len(max_model_len)
 

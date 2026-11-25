@@ -221,6 +221,44 @@ KV_FETCH_STAGES = (
 
 
 @dataclass(slots=True)
+class PrefixFairAdmissionStats:
+    """Windowed arbitration statistics for fair prefix-cache admission.
+
+    All counters cover the interval since the previous `make_stats` call and
+    are reset when the stats are consumed. `inactive_reason` is the one
+    non-counter field and stays constant for the scheduler's lifetime.
+    """
+
+    steps: int = 0
+    """Arbitration steps performed (at least two candidate requests)."""
+
+    promotions: int = 0
+    """Candidates whose position actually moved forward across the window."""
+
+    deferrals: int = 0
+    """Total deferral ticks accumulated by candidates this window."""
+
+    max_deferred_steps: int = 0
+    """Largest deferral debt observed before release in this window."""
+
+    fairness_releases: int = 0
+    """Release rounds in which deadline-exceeded candidates went to the front."""
+
+    probes: int = 0
+    """Prefix-cache probe calls issued within the per-step budget; a call
+    that raises is also counted here and in `probe_errors`."""
+
+    probe_budget_exhausted: int = 0
+    """Candidates scored as zero because the per-step probe budget was spent."""
+
+    probe_errors: int = 0
+    """Probe calls that raised and were degraded to a zero score."""
+
+    inactive_reason: str = ""
+    """Why fair admission is inactive; empty when active."""
+
+
+@dataclass(slots=True)
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -258,6 +296,10 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    # None keeps positional construction and serialization unchanged for
+    # deployments that do not consume fair-admission arbitration.
+    prefix_fair_admission_stats: PrefixFairAdmissionStats | None = None
 
 
 @dataclass(slots=True)
